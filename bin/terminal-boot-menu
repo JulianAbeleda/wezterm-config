@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PATH="$HOME/.local/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}"
+
+MAC_TS_NAME="julians-mac-mini"
+LINUX_TS_NAME="ubuntu-dualboot"
+
+# Override these if the remote account names differ from this laptop:
+#   BOOT_MAC_USER=julian BOOT_LINUX_USER=ubuntu wezterm
+MAC_SSH_USER="${BOOT_MAC_USER:-$USER}"
+LINUX_SSH_USER="${BOOT_LINUX_USER:-ubuntu}"
+TMUX_SESSION="${BOOT_TMUX_SESSION:-main}"
+SSH_PROXY_OPT="ProxyCommand=tailscale nc %h %p"
+
+need() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+esc=$'\033'
+reset="${esc}[0m"
+bold="${esc}[1m"
+dim="${esc}[2m"
+fg_blue="${esc}[38;5;111m"
+fg_cyan="${esc}[38;5;117m"
+fg_green="${esc}[38;5;120m"
+fg_yellow="${esc}[38;5;222m"
+fg_red="${esc}[38;5;203m"
+fg_purple="${esc}[38;5;141m"
+fg_text="${esc}[38;5;189m"
+fg_muted="${esc}[38;5;103m"
+bg_panel="${esc}[48;5;235m"
+alt_screen="${esc}[?1049h"
+main_screen="${esc}[?1049l"
+hide_cursor="${esc}[?25l"
+show_cursor="${esc}[?25h"
+home="${esc}[H"
+clear_to_end="${esc}[J"
+
+CODEX_STATE=""
+CLAUDE_STATE=""
+KIMI_STATE=""
+MAC_STATE=""
+LINUX_STATE=""
+CLIENT_IP=""
+CLIENT_NAME=""
+DRAWN_ONCE=0
+SLOT_ACTIVE_LIST=""
+
+restore_terminal() {
+  printf '%s%s%s' "$reset" "$show_cursor" "$main_screen"
+}
+
+enter_menu_screen() {
+  printf '%s%s' "$alt_screen" "$hide_cursor"
+  trap restore_terminal EXIT INT TERM
+}
+
+pause() {
+  printf '\nPress Enter to return to the boot menu... '
+  read -r _
+}
+
+install_npm_tool() {
+  local command_name="$1"
+  local package_name="$2"
+
+  if need "$command_name"; then
+    return 0
+  fi
+
+  clear
+  printf '%s is not installed.\n\nInstalling %s with npm...\n\n' "$command_name" "$package_name"
+  npm install -g "$package_name"
+}
+
+install_codex() {
+  install_npm_tool codex "@openai/codex"
+}
+
+install_claude() {
+  install_npm_tool claude "@anthropic-ai/claude-code"
+}
+
+install_kimi() {
+  install_npm_tool kimi "@moonshot-ai/kimi-code"
+}
+
+tailscale_ip_for() {
+  local name="$1"
+  tailscale status 2>/dev/null | awk -v host="$name" '$2 == host { print $1; exit }'
+}
+
+server_status() {
+  local name="$1"
+  local ip
+  ip="$(tailscale_ip_for "$name")"
+  if [[ -n "$ip" ]]; then
+    printf '%s' "$ip"
+  else
+    printf 'not found'
+  fi
+}
+
+tool_state() {
+  if need "$1"; then
+    printf '%sinstalled%s' "$fg_green" "$reset"
+  else
+    printf '%smissing%s' "$fg_yellow" "$reset"
+  fi
+}
+
+server_state() {
+  local name="$1"
+  local ip
+  ip="$(tailscale_ip_for "$name")"
+  if [[ -n "$ip" ]]; then
+    printf '%s%s%s' "$fg_green" "$ip" "$reset"
+  else
+    printf '%snot found%s' "$fg_red" "$reset"
+  fi
+}
+
+refresh_slot_status() {
+  local ts_name="$1"
+  local ssh_user="$2"
+  local ip
+
+  SLOT_ACTIVE_LIST=""
+  ip="$(tailscale_ip_for "$ts_name")"
+  if [[ -z "$ip" ]]; then
+    return
+  fi
+
+  SLOT_ACTIVE_LIST="$(
+    ssh -o "$SSH_PROXY_OPT" \
+      -o StrictHostKeyChecking=accept-new \
+      -o ConnectTimeout=4 \
+      "${ssh_user}@${ts_name}" \
+      "tmux list-sessions -F '#S' 2>/dev/null || true" 2>/dev/null || true
+  )"
+}
+
+slot_state() {
+  local session_name="$1"
+
+  if grep -Fxq "$session_name" <<<"$SLOT_ACTIVE_LIST"; then
+    printf '%s● active%s' "$fg_green" "$reset"
+  else
+    printf '%s○ empty%s' "$fg_muted" "$reset"
+  fi
+}
+
+client_name() {
+  cat /proc/sys/kernel/hostname 2>/dev/null || printf 'local'
+}
+
+refresh_status() {
+  CODEX_STATE="$(tool_state codex)"
+  CLAUDE_STATE="$(tool_state claude)"
+  KIMI_STATE="$(tool_state kimi)"
+  MAC_STATE="$(server_state "$MAC_TS_NAME")"
+  LINUX_STATE="$(server_state "$LINUX_TS_NAME")"
+  CLIENT_IP="$(tailscale ip -4 2>/dev/null || printf 'offline')"
+  CLIENT_NAME="$(client_name)"
+  DRAWN_ONCE=0
+}
+
+connect_tmux() {
+  local label="$1"
+  local ts_name="$2"
+  local ssh_user="$3"
+  local session_name="${4:-$TMUX_SESSION}"
+  local ip
+
+  ip="$(tailscale_ip_for "$ts_name")"
+  if [[ -z "$ip" ]]; then
+    printf '%s%s' "$home" "$clear_to_end"
+    printf '%s was not found in tailscale status.\n' "$label"
+    pause
+    refresh_status
+    return
+  fi
+
+  restore_terminal
+  trap - EXIT INT TERM
+  printf 'Connecting to %s at %s as %s, tmux session %s...\n\n' "$label" "$ip" "$ssh_user" "$session_name"
+  exec ssh -t -o "$SSH_PROXY_OPT" -o StrictHostKeyChecking=accept-new "${ssh_user}@${ts_name}" "tmux new-session -A -s ${session_name}"
+}
+
+delete_tmux_session() {
+  local label="$1"
+  local ts_name="$2"
+  local ssh_user="$3"
+  local session_name="$4"
+  local ip confirm
+
+  ip="$(tailscale_ip_for "$ts_name")"
+  if [[ -z "$ip" ]]; then
+    DRAWN_ONCE=0
+    printf '%s%s' "$home" "$clear_to_end"
+    printf '%s was not found in tailscale status.\n' "$label"
+    pause
+    return
+  fi
+
+  printf '%s%s' "$home" "$clear_to_end"
+  printf '\n'
+  printf '  %s%s DELETE SESSION %s%s\n\n' "$bold" "$fg_red" "$(printf '%*s' 47 '' | tr ' ' '=')" "$reset"
+  printf '  Server:  %s%s%s\n' "$fg_text" "$label" "$reset"
+  printf '  Session: %s%s%s\n\n' "$fg_yellow" "$session_name" "$reset"
+  printf '  Kill this tmux session? %s[y/N]%s ' "$fg_red" "$reset"
+  IFS= read -rsn1 confirm
+  printf '\n\n'
+
+  case "$confirm" in
+    y|Y)
+      if ssh -t -o "$SSH_PROXY_OPT" -o StrictHostKeyChecking=accept-new "${ssh_user}@${ts_name}" "tmux has-session -t '${session_name}' 2>/dev/null && tmux kill-session -t '${session_name}'"; then
+        printf '  %sDeleted %s on %s.%s\n' "$fg_green" "$session_name" "$label" "$reset"
+      else
+        printf '  %sNo session named %s was running on %s.%s\n' "$fg_yellow" "$session_name" "$label" "$reset"
+      fi
+      ;;
+    *)
+      printf '  %sDelete cancelled.%s\n' "$fg_muted" "$reset"
+      ;;
+  esac
+
+  pause
+  DRAWN_ONCE=0
+}
+
+menu_row() {
+  local selected="$1"
+  local idx="$2"
+  local key="$3"
+  local label="$4"
+  local detail="$5"
+  local state="$6"
+  local meta=""
+
+  if [[ -n "$detail" ]]; then
+    meta="${fg_muted}${detail}${reset}"
+  fi
+
+  if [[ "$selected" -eq "$idx" ]]; then
+    printf '  %b > %s  %-16s %-30b %b%s\n' "$bg_panel$bold$fg_text" "$key" "$label" "$meta" "$state" "$reset"
+  else
+    printf '      %s%s%s  %-16s %-30b %b\n' "$fg_blue" "$key" "$reset" "$label" "$meta" "$state"
+  fi
+}
+
+draw_menu() {
+  local selected="$1"
+
+  if [[ "$DRAWN_ONCE" -eq 0 ]]; then
+    printf '%s%s' "$home" "$clear_to_end"
+    DRAWN_ONCE=1
+  else
+    printf '%s' "$home"
+  fi
+  printf '\n'
+  printf '  %s%s TERMINAL BOOT %s%s\n' "$bold" "$fg_blue" "$(printf '%*s' 48 '' | tr ' ' '=')" "$reset"
+  printf '  %sClient%s    %s%s%s    %sTailnet%s %s%s%s\n\n' "$fg_muted" "$reset" "$fg_text" "$CLIENT_NAME" "$reset" "$fg_muted" "$reset" "$fg_cyan" "$CLIENT_IP" "$reset"
+  printf '  %s%s Local%s\n' "$bold" "$fg_purple" "$reset"
+  menu_row "$selected" 1 "1" "Native Shell" "login shell on this laptop" "${fg_text}ready${reset}"
+  menu_row "$selected" 2 "2" "Codex" "local coding agent" "[$CODEX_STATE]"
+  menu_row "$selected" 3 "3" "Claude" "local coding agent" "[$CLAUDE_STATE]"
+  menu_row "$selected" 4 "4" "Kimi" "local coding agent" "[$KIMI_STATE]"
+  printf '\n  %s%s Servers%s\n' "$bold" "$fg_purple" "$reset"
+  menu_row "$selected" 5 "5" "Mac Mini" "$MAC_TS_NAME" "$MAC_STATE"
+  menu_row "$selected" 6 "6" "LinuxBox" "$LINUX_TS_NAME" "$LINUX_STATE"
+  printf '\n  %s%s Control%s\n' "$bold" "$fg_purple" "$reset"
+  menu_row "$selected" 7 "7" "Sessions" "pick a server, then tmux slot 1-9" "${fg_text}tmux slots${reset}"
+  menu_row "$selected" 8 "8" "Exit" "close this launcher" "${fg_text}quit${reset}"
+  printf '\n  %s%s%s\n' "$fg_blue" "$(printf '%*s' 65 '' | tr ' ' '=')" "$reset"
+  printf '  %sArrows%s move   %sEnter%s launch   %s1-8%s quick select   %sQ%s quit\n\n' "$fg_muted" "$reset" "$fg_muted" "$reset" "$fg_muted" "$reset" "$fg_muted" "$reset"
+}
+
+draw_sessions_server_menu() {
+  local selected="$1"
+
+  if [[ "$DRAWN_ONCE" -eq 0 ]]; then
+    printf '%s%s' "$home" "$clear_to_end"
+    DRAWN_ONCE=1
+  else
+    printf '%s' "$home"
+  fi
+  printf '\n'
+  printf '  %s%s SESSIONS %s%s\n' "$bold" "$fg_blue" "$(printf '%*s' 53 '' | tr ' ' '=')" "$reset"
+  printf '  %sChoose a server. Each server has tmux slots 1-9.%s\n\n' "$fg_muted" "$reset"
+  menu_row "$selected" 1 "1" "Mac Mini" "$MAC_TS_NAME" "$MAC_STATE"
+  menu_row "$selected" 2 "2" "LinuxBox" "$LINUX_TS_NAME" "$LINUX_STATE"
+  printf '\n  %s%s%s\n' "$fg_blue" "$(printf '%*s' 65 '' | tr ' ' '=')" "$reset"
+  printf '  %sArrows%s move   %sEnter%s select   %s1-2%s quick select   %sB%s back   %sQ%s quit\n\n' "$fg_muted" "$reset" "$fg_muted" "$reset" "$fg_muted" "$reset" "$fg_muted" "$reset" "$fg_muted" "$reset"
+}
+
+draw_slot_menu() {
+  local selected="$1"
+  local label="$2"
+  local ts_name="$3"
+  local state="$4"
+  local i
+
+  if [[ "$DRAWN_ONCE" -eq 0 ]]; then
+    printf '%s%s' "$home" "$clear_to_end"
+    DRAWN_ONCE=1
+  else
+    printf '%s' "$home"
+  fi
+  printf '\n'
+  printf '  %s%s %s SLOTS %s%s\n' "$bold" "$fg_blue" "$label" "$(printf '%*s' 47 '' | tr ' ' '=')" "$reset"
+  printf '  %sServer%s    %s%s%s    %sStatus%s %b\n\n' "$fg_muted" "$reset" "$fg_text" "$ts_name" "$reset" "$fg_muted" "$reset" "$state"
+  printf '  %s%s tmux slots%s\n' "$bold" "$fg_purple" "$reset"
+  for i in 1 2 3 4 5 6 7 8 9; do
+    menu_row "$selected" "$i" "$i" "Slot $i" "tmux session: slot$i" "$(slot_state "slot$i")"
+  done
+  printf '\n  %s%s%s\n' "$fg_blue" "$(printf '%*s' 65 '' | tr ' ' '=')" "$reset"
+  printf '  %sArrows%s move   %sEnter%s connect   %s1-9%s quick select   %sD%s delete   %sB%s back   %sQ%s quit\n\n' "$fg_muted" "$reset" "$fg_muted" "$reset" "$fg_muted" "$reset" "$fg_muted" "$reset" "$fg_muted" "$reset" "$fg_muted" "$reset"
+}
+
+read_nav_key() {
+  local __result_var="$1"
+  local key rest value
+
+  IFS= read -rsn1 key
+  case "$key" in
+    "")
+      value="enter"
+      ;;
+    [0-9])
+      value="$key"
+      ;;
+    b|B)
+      value="back"
+      ;;
+    d|D)
+      value="delete"
+      ;;
+    q|Q)
+      value="quit"
+      ;;
+    $'\033')
+      IFS= read -rsn2 -t 0.1 rest || true
+      case "$rest" in
+        "[A"|"[D") value="prev" ;;
+        "[B"|"[C") value="next" ;;
+        *) value="" ;;
+      esac
+      ;;
+    *)
+      value=""
+      ;;
+  esac
+
+  printf -v "$__result_var" '%s' "$value"
+}
+
+slot_menu_loop() {
+  local label="$1"
+  local ts_name="$2"
+  local ssh_user="$3"
+  local state="$4"
+  local selected=1
+  local action
+
+  DRAWN_ONCE=0
+  refresh_slot_status "$ts_name" "$ssh_user"
+  while true; do
+    draw_slot_menu "$selected" "$label" "$ts_name" "$state"
+    read_nav_key action
+    case "$action" in
+      enter)
+        connect_tmux "$label" "$ts_name" "$ssh_user" "slot$selected"
+        DRAWN_ONCE=0
+        ;;
+      [1-9])
+        connect_tmux "$label" "$ts_name" "$ssh_user" "slot$action"
+        DRAWN_ONCE=0
+        ;;
+      back)
+        DRAWN_ONCE=0
+        return
+        ;;
+      quit)
+        exit 0
+        ;;
+      delete)
+        delete_tmux_session "$label" "$ts_name" "$ssh_user" "slot$selected"
+        refresh_slot_status "$ts_name" "$ssh_user"
+        ;;
+      prev)
+        ((selected--))
+        [[ "$selected" -lt 1 ]] && selected=9
+        ;;
+      next)
+        ((selected++))
+        [[ "$selected" -gt 9 ]] && selected=1
+        ;;
+    esac
+  done
+}
+
+sessions_menu_loop() {
+  local selected=1
+  local action
+
+  DRAWN_ONCE=0
+  while true; do
+    draw_sessions_server_menu "$selected"
+    read_nav_key action
+    case "$action" in
+      enter)
+        case "$selected" in
+          1) slot_menu_loop "Mac Mini" "$MAC_TS_NAME" "$MAC_SSH_USER" "$MAC_STATE" ;;
+          2) slot_menu_loop "LinuxBox" "$LINUX_TS_NAME" "$LINUX_SSH_USER" "$LINUX_STATE" ;;
+        esac
+        DRAWN_ONCE=0
+        ;;
+      1)
+        slot_menu_loop "Mac Mini" "$MAC_TS_NAME" "$MAC_SSH_USER" "$MAC_STATE"
+        DRAWN_ONCE=0
+        ;;
+      2)
+        slot_menu_loop "LinuxBox" "$LINUX_TS_NAME" "$LINUX_SSH_USER" "$LINUX_STATE"
+        DRAWN_ONCE=0
+        ;;
+      back)
+        DRAWN_ONCE=0
+        return
+        ;;
+      quit|8)
+        exit 0
+        ;;
+      prev)
+        ((selected--))
+        [[ "$selected" -lt 1 ]] && selected=2
+        ;;
+      next)
+        ((selected++))
+        [[ "$selected" -gt 2 ]] && selected=1
+        ;;
+    esac
+  done
+}
+
+run_choice() {
+  local choice="$1"
+
+  case "$choice" in
+    1)
+      restore_terminal
+      trap - EXIT INT TERM
+      exec "${SHELL:-/usr/bin/bash}" -l
+      ;;
+    2)
+      restore_terminal
+      trap - EXIT INT TERM
+      install_codex
+      exec codex
+      ;;
+    3)
+      restore_terminal
+      trap - EXIT INT TERM
+      install_claude
+      exec claude
+      ;;
+    4)
+      restore_terminal
+      trap - EXIT INT TERM
+      install_kimi
+      exec kimi
+      ;;
+    5)
+      connect_tmux "Mac Mini" "$MAC_TS_NAME" "$MAC_SSH_USER"
+      ;;
+    6)
+      connect_tmux "LinuxBox" "$LINUX_TS_NAME" "$LINUX_SSH_USER"
+      ;;
+    7)
+      sessions_menu_loop
+      DRAWN_ONCE=0
+      ;;
+    8)
+      exit 0
+      ;;
+  esac
+}
+
+menu_loop() {
+  local selected=1
+  local action
+
+  enter_menu_screen
+  refresh_status
+
+  while true; do
+    draw_menu "$selected"
+    read_nav_key action
+
+    case "$action" in
+      enter)
+        run_choice "$selected"
+        ;;
+      [1-8])
+        run_choice "$action"
+        ;;
+      quit)
+        exit 0
+        ;;
+      prev)
+        ((selected--))
+        [[ "$selected" -lt 1 ]] && selected=8
+        ;;
+      next)
+        ((selected++))
+        [[ "$selected" -gt 8 ]] && selected=1
+        ;;
+    esac
+  done
+}
+
+menu_loop
