@@ -90,6 +90,42 @@ config.colors = {
   },
 }
 
+-- On macOS the left/right Option key still composes accented characters; only
+-- the specific Option combos bound below are intercepted. No-op on Linux.
+config.send_composed_key_when_left_alt_is_pressed = true
+config.send_composed_key_when_right_alt_is_pressed = true
+
+local function close_after_tmux_command(window, pane, tmux_keys)
+  pane:send_text(tmux_keys)
+  wezterm.time.call_after(0.2, function()
+    window:perform_action(act.CloseCurrentPane { confirm = false }, pane)
+  end)
+end
+
+local function send_tmux_command(pane, tmux_keys)
+  pane:send_text(tmux_keys)
+end
+
+-- Cmd+W ends the current tmux session (detach / kill / cancel) rather than
+-- closing the tab, matching the personal config. Alt+W still closes a pane.
+local pause_prompt = act.InputSelector {
+  title = 'Pause',
+  description = 'End Session?',
+  alphabet = '123',
+  choices = {
+    { id = 'pause', label = '1 - Yes' },
+    { id = 'kill', label = '2 - Yes - Kill Session' },
+    { id = 'cancel', label = '3 - No' },
+  },
+  action = wezterm.action_callback(function(window, pane, id)
+    if id == 'pause' then
+      close_after_tmux_command(window, pane, '\x02d')
+    elseif id == 'kill' then
+      send_tmux_command(pane, '\x02:kill-session\r')
+    end
+  end),
+}
+
 config.keys = {
   -- Mac-style muscle memory on this keyboard: Alt is the Command-like key.
   { key = 't', mods = 'ALT', action = act.SpawnTab 'CurrentPaneDomain' },
@@ -112,7 +148,7 @@ config.keys = {
 
   -- Super fallback: the Windows key can still behave like Command.
   { key = 't', mods = 'SUPER', action = act.SpawnTab 'CurrentPaneDomain' },
-  { key = 'w', mods = 'SUPER', action = act.CloseCurrentTab { confirm = true } },
+  { key = 'w', mods = 'SUPER', action = pause_prompt },
   { key = 'd', mods = 'SUPER', action = act.SplitHorizontal { domain = 'CurrentPaneDomain' } },
   { key = 'D', mods = 'SUPER|SHIFT', action = act.SplitVertical { domain = 'CurrentPaneDomain' } },
   { key = 'Enter', mods = 'SUPER|SHIFT', action = act.TogglePaneZoomState },
@@ -124,6 +160,31 @@ config.keys = {
   { key = 'DownArrow', mods = 'SUPER|SHIFT', action = act.AdjustPaneSize { 'Down', 2 } },
   { key = '[', mods = 'SUPER|SHIFT', action = act.ActivateTabRelative(-1) },
   { key = ']', mods = 'SUPER|SHIFT', action = act.ActivateTabRelative(1) },
+
+  -- macOS Command/Option muscle memory (ported from the personal modules/keys.lua).
+  { key = 'Enter', mods = 'SUPER', action = act.ToggleFullScreen },
+  { key = 'c', mods = 'SUPER', action = act.CopyTo 'Clipboard' },
+  { key = 'v', mods = 'SUPER', action = act.PasteFrom 'Clipboard' },
+  { key = 'n', mods = 'SUPER', action = act.SpawnWindow },
+  { key = 'm', mods = 'SUPER', action = act.Hide },
+  {
+    key = 'a',
+    mods = 'SUPER',
+    action = wezterm.action_callback(function(window, pane)
+      local dims = pane:get_dimensions()
+      local text = pane:get_text_from_region(0, dims.scrollback_top, 0, dims.scrollback_top + dims.scrollback_rows)
+      window:copy_to_clipboard(text:match '^%s*(.-)%s*$')
+    end),
+  },
+  { key = 'DownArrow', mods = 'SUPER', action = act.ScrollToBottom },
+  { key = 'LeftArrow', mods = 'SUPER|OPT', action = act.ActivatePaneDirection 'Left' },
+  { key = 'RightArrow', mods = 'SUPER|OPT', action = act.ActivatePaneDirection 'Right' },
+  { key = 'UpArrow', mods = 'SUPER|OPT', action = act.ActivatePaneDirection 'Up' },
+  { key = 'DownArrow', mods = 'SUPER|OPT', action = act.ActivatePaneDirection 'Down' },
+  -- Option word/char editing (readline-style) at the shell prompt.
+  { key = 'LeftArrow', mods = 'OPT', action = act.SendString '\x1bb' },
+  { key = 'RightArrow', mods = 'OPT', action = act.SendString '\x1bf' },
+  { key = 'Backspace', mods = 'OPT', action = act.SendString '\x1b\x7f' },
 
   -- Same actions without Super for keyboards/window managers that intercept it.
   { key = 't', mods = 'CTRL|SHIFT', action = act.SpawnTab 'CurrentPaneDomain' },
