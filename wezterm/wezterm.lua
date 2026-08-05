@@ -1,12 +1,34 @@
 local wezterm = require 'wezterm'
 local config = wezterm.config_builder()
 local act = wezterm.action
-local home = os.getenv 'HOME'
+
+-- Platform detection (macOS + Linux).
+local target = wezterm.target_triple
+local is_linux = target:find 'linux' ~= nil
+
+local home = os.getenv 'HOME' or wezterm.home_dir
 
 -- Work around a GNOME Wayland HiDPI buffer-scale crash on this machine.
-config.enable_wayland = false
+-- Wayland only exists on Linux; guarding keeps this a no-op on macOS.
+if is_linux then
+  config.enable_wayland = false
+end
 
-config.default_prog = { home .. '/.local/bin/terminal-boot-menu' }
+-- Launch the terminal boot menu when it's installed, otherwise fall back to
+-- the default login shell so a machine without the menu still opens cleanly.
+local function file_exists(path)
+  local f = io.open(path, 'r')
+  if f then
+    f:close()
+    return true
+  end
+  return false
+end
+
+local boot_menu = home .. '/.local/bin/terminal-boot-menu'
+if file_exists(boot_menu) then
+  config.default_prog = { boot_menu }
+end
 config.term = 'wezterm'
 
 config.font = wezterm.font_with_fallback {
