@@ -31,6 +31,13 @@ if file_exists(boot_menu) then
 end
 config.term = 'wezterm'
 
+-- Honor kitty keyboard protocol requests, which report real press/release
+-- events instead of bare characters. Terminal emulators (retroemu) need this:
+-- without release events a held direction stalls for the OS key-repeat delay.
+-- Defaults to false. If the Esc key ever misbehaves, delete this line — older
+-- WezTerm builds have a known bug with it.
+config.enable_kitty_keyboard = true
+
 config.font = wezterm.font_with_fallback {
   'JetBrains Mono',
   'Symbols Nerd Font Mono',
