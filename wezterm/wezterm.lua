@@ -103,9 +103,17 @@ config.send_composed_key_when_left_alt_is_pressed = true
 config.send_composed_key_when_right_alt_is_pressed = true
 
 local function close_after_tmux_command(window, pane, tmux_keys)
+  -- Detaching usually ends the pane's process (ssh is exec'd), so the pane
+  -- closes itself. Only close it if it is still around; otherwise
+  -- CloseCurrentPane would hit whichever pane became active and can take the
+  -- whole window with it.
+  local pane_id = pane:pane_id()
   pane:send_text(tmux_keys)
   wezterm.time.call_after(0.2, function()
-    window:perform_action(act.CloseCurrentPane { confirm = false }, pane)
+    local ok, still_open = pcall(wezterm.mux.get_pane, pane_id)
+    if ok and still_open then
+      window:perform_action(act.CloseCurrentPane { confirm = false }, still_open)
+    end
   end)
 end
 
@@ -133,6 +141,10 @@ local pause_prompt = act.InputSelector {
   end),
 }
 
+-- Always ask before closing a pane, even when it's only running a shell.
+-- WezTerm's own y/n prompt covers just the pane being closed.
+config.skip_close_confirmation_for_processes_named = {}
+
 config.keys = {
   -- Mac-style muscle memory on this keyboard: Alt is the Command-like key.
   { key = 't', mods = 'ALT', action = act.SpawnTab 'CurrentPaneDomain' },
@@ -155,7 +167,7 @@ config.keys = {
 
   -- Super fallback: the Windows key can still behave like Command.
   { key = 't', mods = 'SUPER', action = act.SpawnTab 'CurrentPaneDomain' },
-  { key = 'w', mods = 'SUPER', action = pause_prompt },
+  { key = 'w', mods = 'SUPER', action = act.CloseCurrentPane { confirm = true } },
   { key = 'd', mods = 'SUPER', action = act.SplitHorizontal { domain = 'CurrentPaneDomain' } },
   { key = 'D', mods = 'SUPER|SHIFT', action = act.SplitVertical { domain = 'CurrentPaneDomain' } },
   { key = 'Enter', mods = 'SUPER|SHIFT', action = act.TogglePaneZoomState },
